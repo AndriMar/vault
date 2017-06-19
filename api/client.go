@@ -430,3 +430,141 @@ START:
 
 	return result, nil
 }
+
+// Renew starts a background process for renewing this secret. When the secret
+// is has auth data, this attempts to renew the auth (token). When the secret
+// has a lease, this attempts to renew the lease.
+//
+// The channel will return if renewal fails or if the remaining lease duration
+// after a renewal is less than or equal to the grace (in number of seconds). In
+// both cases, the caller should attempt a re-read of the secret.
+//
+// The doneCh will return when renewal is finished or an error occurred. Clients
+// should check the return value of the channel to see if renewal was
+// successful. The stopCh  is provided as a cancellation mechanism. Clients
+// should use this to cancel the renewal process and terminate the udnerlying
+// goroutines.
+//
+// This function will not return if nothing is reading from doneCh (it blocks)
+// on a write to the channel.
+func (c *Client) Renew(s *Secret, grace int, doneCh chan<- error, stopCh <-chan struct{}) {
+	if s.Auth != nil {
+		doneCh <- c.renewAuth(s.Auth.ClientToken, grace, stopCh)
+	} else if s.LeaseID != "" {
+		doneCh <- c.renewLease(s.LeaseID, grace, stopCh)
+	}
+}
+
+// Renewer returns a function for renewing the given secret with the finish
+// channel and the stopping channel.
+//
+//     renew, doneCh, stopCh := client.Renewer(secret, 15)
+//     go renew()
+//
+//     select {
+//       case err := doneCh:
+//         if err != nil {
+//           panic(err)
+//         }
+//       default:
+//         close(stopCh)
+//     }
+//
+func (c *Client) Renewer(s *Secret, grace int) (func(), chan error, chan struct{}) {
+	doneCh, stopCh := make(chan error), make(chan struct{}, 1)
+	return func() {
+		c.Renew(s, grace, doneCh, stopCh)
+	}, doneCh, stopCh
+}
+
+// renewAuth is a helper for renewing authentication
+func (c *Client) renewAuth(token string, grace int, stopCh <-chan struct{}) error {
+	// Create a cloned client and authenticate as this token. This prevents the
+	// need to give priviledged access to the renewal process, since all tokens
+	// inherit renew-self by default.
+	clone, err := NewClient(c.config)
+	if err != nil {
+		return err
+	}
+	clone.SetToken(token)
+
+	for {
+		select {
+		case <-stopCh:
+			return nil
+		default:
+		}
+
+		renewal, err := clone.Auth().Token().RenewSelf(0)
+		if err != nil {
+			return err
+		}
+
+		// Somehow, sometimes, this happens.
+		if renewal == nil || renewal.Auth == nil {
+			return nil
+		}
+
+		// Do nothing if we are not renewable
+		if !renewal.Auth.Renewable {
+			return nil
+		}
+
+		// Grab the lease duration - note that we grab the auth lease duration, not
+		// the secret lease duration.
+		leaseDuration := renewal.Auth.LeaseDuration
+
+		// If we are within grace, return now.
+		if leaseDuration <= grace {
+			return nil
+		}
+
+		select {
+		case <-stopCh:
+			return nil
+		case <-time.After(time.Duration(leaseDuration/2.0) * time.Second):
+			continue
+		}
+	}
+}
+
+// renewLease is a helper for renewing a lease.
+func (c *Client) renewLease(leaseID string, grace int, stopCh <-chan struct{}) error {
+	for {
+		select {
+		case <-stopCh:
+			return nil
+		default:
+		}
+
+		renewal, err := c.Sys().Renew(leaseID, 0)
+		if err != nil {
+			return err
+		}
+
+		// Somehow, sometimes, this happens.
+		if renewal == nil {
+			return nil
+		}
+
+		// Do nothing if we are not renewable
+		if !renewal.Renewable {
+			return nil
+		}
+
+		// Grab the lease duration
+		leaseDuration := renewal.LeaseDuration
+
+		// If we are within grace, return now.
+		if leaseDuration <= grace {
+			return nil
+		}
+
+		select {
+		case <-stopCh:
+			return nil
+		case <-time.After(time.Duration(leaseDuration/2.0) * time.Second):
+			continue
+		}
+	}
+}
